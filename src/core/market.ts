@@ -1,8 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import { db, query } from "./db";
+import { ProviderError } from "./jev";
 import type { Bar, Instrument } from "./types";
 export function hash(s: string) {
   return createHash("sha256").update(s).digest("hex");
+}
+export async function recordCorporateAction(
+  instrumentId: string,
+  date: string,
+  kind: "split" | "dividend",
+  details: string,
+) {
+  await db().execute({
+    sql: "INSERT OR IGNORE INTO corporate_actions VALUES(?,?,?,?,?)",
+    args: [
+      hash(`${instrumentId}:${date}:${kind}`),
+      instrumentId,
+      date,
+      kind,
+      details,
+    ],
+  });
 }
 export const demoInstruments: Instrument[] = [
   {
@@ -108,35 +126,33 @@ export function demoBars(index: number, until = new Date()): Bar[] {
 export async function saveBars(id: string, bars: Bar[], origin: string) {
   for (let i = 0; i < bars.length; i += 100)
     await db().batch(
-      bars
-        .slice(i, i + 100)
-        .map((b) => ({
-          sql: "INSERT OR IGNORE INTO bars VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-          args: [
-            hash(
-              JSON.stringify([
-                id,
-                origin,
-                b.date,
-                b.open,
-                b.high,
-                b.low,
-                b.close,
-                b.volume,
-              ]),
-            ),
-            id,
-            b.date,
-            b.open,
-            b.high,
-            b.low,
-            b.close,
-            b.volume,
-            b.receivedAt,
-            b.availableAt,
-            origin,
-          ],
-        })),
+      bars.slice(i, i + 100).map((b) => ({
+        sql: "INSERT OR IGNORE INTO bars VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        args: [
+          hash(
+            JSON.stringify([
+              id,
+              origin,
+              b.date,
+              b.open,
+              b.high,
+              b.low,
+              b.close,
+              b.volume,
+            ]),
+          ),
+          id,
+          b.date,
+          b.open,
+          b.high,
+          b.low,
+          b.close,
+          b.volume,
+          b.receivedAt,
+          b.availableAt,
+          origin,
+        ],
+      })),
       "write",
     );
 }
@@ -218,46 +234,55 @@ async function jquants(path: string, params: Record<string, string>) {
     throw new Error("JQUANTS_API_KEYが未設定です。");
   const url = new URL("https://api.jquants.com/v2/" + path);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const r = await fetch(url, {
-    headers: { "x-api-key": process.env.JQUANTS_API_KEY },
-    signal: AbortSignal.timeout(15000),
-  });
+  let r: Response;
+  try {
+    r = await fetch(url, {
+      headers: { "x-api-key": process.env.JQUANTS_API_KEY },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    throw new ProviderError("市場データ取得がタイムアウトしました。", true);
+  }
   if (!r.ok)
-    throw new Error(`市場データ取得に失敗しました（HTTP ${r.status}）。`);
+    throw new ProviderError(
+      `市場データ取得に失敗しました（HTTP ${r.status}）。`,
+      r.status === 429 || r.status >= 500,
+      Math.min(3600, Math.max(0, Number(r.headers.get("retry-after")) || 0)),
+    );
   return r.json();
 }
-export async function syncMaster() {
-  let key: string | undefined;
-  let pages = 0;
-  do {
-    const data = await jquants(
-      "equities/master",
-      key ? { pagination_key: key } : {},
-    );
-    if (!Array.isArray(data.data))
-      throw new Error("銘柄マスターの応答形式が不正です。");
-    await db().batch(
-      data.data.map((x: Record<string, unknown>) => ({
-        sql: "INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,sector=excluded.sector",
-        args: [
-          "jp-" + String(x.Code),
-          String(x.Code),
-          String(x.CoName ?? x.Code),
-          String(x.S17Nm ?? "国内株式"),
-          "JPY",
-          100,
-          "jquants",
-          0,
-          "#397f61",
-        ],
-      })),
-      "write",
-    );
-    key = data.pagination_key;
-    if (++pages > 15) throw new Error("マスターの取得上限に達しました。");
-  } while (key);
+export async function syncMaster(key?: string): Promise<string | undefined> {
+  const data = await jquants(
+    "equities/master",
+    key ? { pagination_key: key } : {},
+  );
+  if (!Array.isArray(data.data))
+    throw new Error("銘柄マスターの応答形式が不正です。");
+  await db().batch(
+    data.data.map((x: Record<string, unknown>) => ({
+      sql: "INSERT INTO instruments VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,sector=excluded.sector",
+      args: [
+        "jp-" + String(x.Code),
+        String(x.Code),
+        String(x.CoName ?? x.Code),
+        String(x.S17Nm ?? "国内株式"),
+        "JPY",
+        100,
+        "jquants",
+        0,
+        "#397f61",
+      ],
+    })),
+    "write",
+  );
+  return typeof data.pagination_key === "string"
+    ? data.pagination_key
+    : undefined;
 }
-export async function refreshInstrument(item: Instrument) {
+export async function refreshInstrument(
+  item: Instrument,
+  key?: string,
+): Promise<string | undefined> {
   if (item.origin === "demo") {
     await saveBars(
       item.id,
@@ -269,32 +294,39 @@ export async function refreshInstrument(item: Instrument) {
   if (item.origin === "csv") return;
   const from = new Date();
   from.setUTCFullYear(from.getUTCFullYear() - 1);
-  let key: string | undefined;
-  let pages = 0;
-  do {
-    const data = await jquants("equities/bars/daily", {
-      code: item.symbol,
-      from: from.toISOString().slice(0, 10),
-      ...(key ? { pagination_key: key } : {}),
-    });
-    if (!Array.isArray(data.data)) throw new Error("価格応答形式が不正です。");
-    const now = new Date().toISOString();
-    const bars: Bar[] = data.data
-      .filter((x: Record<string, unknown>) => x.O != null && x.C != null)
-      .map((x: Record<string, unknown>) => ({
-        date: String(x.Date),
-        open: String(x.O),
-        high: String(x.H),
-        low: String(x.L),
-        close: String(x.C),
-        volume: Number(x.Vo),
-        receivedAt: now,
-        availableAt: String(x.Date) + "T09:00:00Z",
-      }));
-    if (bars.length) await saveBars(item.id, validateBars(bars), "jquants");
-    key = data.pagination_key;
-    if (++pages > 10) throw new Error("価格取得上限に達しました。");
-  } while (key);
+  const data = await jquants("equities/bars/daily", {
+    code: item.symbol,
+    from: from.toISOString().slice(0, 10),
+    ...(key ? { pagination_key: key } : {}),
+  });
+  if (!Array.isArray(data.data)) throw new Error("価格応答形式が不正です。");
+  for (const row of data.data) {
+    if (row.AdjFactor != null && Number(row.AdjFactor) !== 1) {
+      await recordCorporateAction(
+        item.id,
+        String(row.Date),
+        "split",
+        JSON.stringify({ provider: "jquants", factor: row.AdjFactor }),
+      );
+    }
+  }
+  const now = new Date().toISOString();
+  const bars: Bar[] = data.data
+    .filter((x: Record<string, unknown>) => x.O != null && x.C != null)
+    .map((x: Record<string, unknown>) => ({
+      date: String(x.Date),
+      open: String(x.O),
+      high: String(x.H),
+      low: String(x.L),
+      close: String(x.C),
+      volume: Number(x.Vo),
+      receivedAt: now,
+      availableAt: String(x.Date) + "T09:00:00Z",
+    }));
+  if (bars.length) await saveBars(item.id, validateBars(bars), "jquants");
+  return typeof data.pagination_key === "string"
+    ? data.pagination_key
+    : undefined;
 }
 export async function importCsv(name: string, text: string) {
   const id = "csv-" + randomUUID();

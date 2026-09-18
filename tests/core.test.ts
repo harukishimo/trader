@@ -9,6 +9,7 @@ import {
   saveBars,
   seed,
   getBars,
+  recordCorporateAction,
 } from "../src/core/market";
 import { indicators, maxDrawdown, positionSize } from "../src/core/analysis";
 import {
@@ -17,7 +18,12 @@ import {
   mockEvaluation,
   ProviderError,
 } from "../src/core/jev";
-import { requestEvaluation, runJobs, checkAlerts } from "../src/core/jobs";
+import {
+  requestEvaluation,
+  runJobs,
+  checkAlerts,
+  enqueue,
+} from "../src/core/jobs";
 import {
   advancePaper,
   createAccounts,
@@ -86,6 +92,146 @@ describe("financial calculations and inputs", () => {
   });
 });
 describe("Jev and persistent jobs", () => {
+  it("resumes market pagination within the same durable job", async () => {
+    process.env.JQUANTS_API_KEY = "test-key";
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Response.json({
+          data: [{ Code: "12340", CoName: "Page one" }],
+          pagination_key: "second",
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ data: [{ Code: "56780", CoName: "Page two" }] }),
+      );
+    vi.stubGlobal("fetch", fetcher);
+    const job = await enqueue("master", {}, "master-test");
+    await runJobs();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(String(fetcher.mock.calls[1][0])).toContain("pagination_key=second");
+    expect(
+      await query("SELECT * FROM instruments WHERE origin='jquants'"),
+    ).toHaveLength(2);
+    expect(
+      (
+        await query<{ state: string }>("SELECT state FROM jobs WHERE id=?", [
+          job.id,
+        ])
+      )[0].state,
+    ).toBe("succeeded");
+  });
+  it("keeps paper jobs pending until their price dependencies complete", async () => {
+    const dependency = await enqueue(
+      "refresh",
+      { instrumentId: "demo-1" },
+      "dependency",
+    );
+    await db().execute({
+      sql: "UPDATE jobs SET run_after='2099-01-01T00:00:00Z' WHERE id=?",
+      args: [dependency.id],
+    });
+    const paper = await enqueue(
+      "paper",
+      { dependencies: [dependency.id] },
+      "paper-dependency",
+    );
+    await runJobs();
+    expect(
+      (
+        await query<{ state: string; attempts: number }>(
+          "SELECT state,attempts FROM jobs WHERE id=?",
+          [paper.id],
+        )
+      )[0],
+    ).toEqual({ state: "pending", attempts: 0 });
+    expect(await query("SELECT * FROM fills")).toHaveLength(0);
+  });
+  it("recovers expired worker and job leases", async () => {
+    const { job } = await requestEvaluation(
+      "demo-1",
+      snapshot.document,
+      null,
+      true,
+    );
+    await db().execute(
+      "INSERT INTO service_locks VALUES('worker','old','2000-01-01T00:00:00Z')",
+    );
+    await db().execute({
+      sql: "UPDATE jobs SET state='running',attempts=1,lease_owner='old',lease_until='2000-01-01T00:00:00Z' WHERE id=?",
+      args: [job.id],
+    });
+    await runJobs();
+    expect(
+      (
+        await query<{ state: string }>("SELECT state FROM jobs WHERE id=?", [
+          job.id,
+        ])
+      )[0].state,
+    ).toBe("succeeded");
+    expect(await query("SELECT * FROM service_locks")).toHaveLength(0);
+  });
+  it("records an attempt before HTTP and excludes concurrent workers", async () => {
+    process.env.APP_MODE = "live";
+    process.env.JEV_PROVIDER = "typesafe";
+    process.env.TYPESAFE_API_KEY = "test-key";
+    process.env.ALLOW_AI_DATA_TRANSFER = "true";
+    let entered!: () => void;
+    let respond!: (response: Response) => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const response = new Promise<Response>((resolve) => {
+      respond = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        entered();
+        return response;
+      }),
+    );
+    await requestEvaluation("demo-1", snapshot.document, null, true);
+    const worker = runJobs();
+    await started;
+    try {
+      expect(
+        (await query<{ status: string }>("SELECT status FROM attempts"))[0]
+          .status,
+      ).toBe("running");
+      expect(await runJobs()).toEqual({ completed: 0, busy: true });
+    } finally {
+      respond(
+        Response.json({ model: "jev-test", answers: mockEvaluation(snapshot) }),
+      );
+      await worker;
+    }
+    expect(await query("SELECT * FROM attempts")).toHaveLength(1);
+  });
+  it("does not retry authentication failures or accept missing questions", async () => {
+    process.env.APP_MODE = "live";
+    process.env.JEV_PROVIDER = "typesafe";
+    process.env.TYPESAFE_API_KEY = "test-key";
+    process.env.ALLOW_AI_DATA_TRANSFER = "true";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("", { status: 401 })),
+    );
+    await requestEvaluation("demo-1", snapshot.document, null, true);
+    await runJobs();
+    expect(
+      (
+        await query<{ state: string; attempts: number }>(
+          "SELECT state,attempts FROM jobs",
+        )
+      )[0],
+    ).toEqual({ state: "failed", attempts: 1 });
+    expect(
+      answersSchema.safeParse({
+        event_type: mockEvaluation(snapshot).event_type,
+      }).success,
+    ).toBe(false);
+  });
   it("deduplicates evaluation requests and job execution", async () => {
     const first = await requestEvaluation(
       "demo-1",
@@ -193,6 +339,50 @@ describe("Jev and persistent jobs", () => {
   });
 });
 describe("alerts and paper accounting", () => {
+  it("marks a pending order across a corporate action as unsupported", async () => {
+    await createAccounts({
+      name: "split",
+      cash: "1000000",
+      allocation: "0.2",
+      stopLoss: "20",
+      fee: "10",
+      slippage: "10",
+      origin: "demo",
+    });
+    const [a] = await query<{ id: string }>(
+      "SELECT id FROM accounts WHERE use_jev=0",
+    );
+    await db().execute({
+      sql: "INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?)",
+      args: [
+        "split-order",
+        a.id,
+        "demo-1",
+        "buy",
+        "100",
+        "pending",
+        "2026-01-01T10:00:00Z",
+        "2026-01-01",
+        "split-order",
+        "2026-01-01T10:00:00Z",
+      ],
+    });
+    await recordCorporateAction(
+      "demo-1",
+      "2026-01-02",
+      "split",
+      "Fixture: 2-for-1",
+    );
+    await advancePaper(new Date("2026-01-02T12:00:00Z"));
+    const account = (await paperSummaries()).find((x) => x.id === a.id)!;
+    expect(account.state).toBe("unsupported");
+    expect(account.equity).toBeNull();
+    expect(account.pnl).toBeNull();
+    expect(account.unavailableReason).toContain("検証対象外");
+    expect(
+      await query("SELECT * FROM fills WHERE account_id=?", [a.id]),
+    ).toHaveLength(0);
+  });
   it("rejects a sell without inventory and keeps cash unchanged", async () => {
     await createAccounts({
       name: "oversell",
@@ -315,5 +505,10 @@ describe("alerts and paper accounting", () => {
       ledger.reduce((s, x) => s + Number(x.amount), 0),
       3,
     );
+    const summary = (await paperSummaries()).find((x) => x.id === a.id)!;
+    expect(Number(summary.realizedPnl)).toBeCloseTo(0, 2);
+    expect(
+      Number(summary.realizedPnl) + Number(summary.unrealizedPnl),
+    ).toBeCloseTo(Number(summary.pnl), 2);
   });
 });

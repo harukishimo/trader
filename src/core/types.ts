@@ -46,7 +46,13 @@ export type Answers = {
     probabilities: Record<string, number>;
     confidence: number;
   };
-  importance: { type: "score"; score: number; confidence: number };
+  importance: {
+    type: "score";
+    score: number;
+    confidence: number;
+    probabilities?: Record<string, number>;
+    legend?: Record<string, string>;
+  };
   duplicate: { type: "noul"; noul: number };
 };
 export type Job = {
@@ -83,8 +89,11 @@ export type PaperAccount = {
 export type Holding = { instrument_id: string; quantity: string; cost: string };
 export type PaperSummary = PaperAccount & {
   holdings: Holding[];
-  equity: string;
-  pnl: string;
+  equity: string | null;
+  pnl: string | null;
+  realizedPnl: string | null;
+  unrealizedPnl: string | null;
+  unavailableReason: string | null;
   maxDrawdown: number;
   curve: { date: string; value: number }[];
   fills: Record<string, unknown>[];
@@ -103,6 +112,13 @@ export type Snapshot = {
   permission: boolean;
 };
 export type Bootstrap = {
+  corporateActions: {
+    id: string;
+    instrument_id: string;
+    effective_date: string;
+    kind: string;
+    payload: string;
+  }[];
   instruments: (Instrument & { bars: Bar[] })[];
   evaluations: Evaluation[];
   jobs: Job[];

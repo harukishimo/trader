@@ -45,6 +45,9 @@ export async function bootstrap(): Promise<Bootstrap> {
     query<{ n: number }>("SELECT coalesce(sum(usage),0) as n FROM attempts"),
   ]);
   return {
+    corporateActions: await query(
+      "SELECT * FROM corporate_actions ORDER BY effective_date DESC LIMIT 100",
+    ),
     instruments,
     evaluations,
     jobs,

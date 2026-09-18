@@ -6,6 +6,7 @@ import { seed } from "../src/core/market";
 const tables = [
   "instruments",
   "bars",
+  "corporate_actions",
   "evaluations",
   "attempts",
   "jobs",

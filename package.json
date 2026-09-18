@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "engines": {
-    "node": ">=22.16.0"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1",
@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:production": "node --import tsx scripts/verify-production.ts",
     "db:migrate": "node --import tsx scripts/db.ts migrate",
     "db:seed": "node --import tsx scripts/db.ts seed",
     "db:backup": "node --import tsx scripts/db.ts backup",

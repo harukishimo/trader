@@ -17,6 +17,38 @@ import type {
   Evaluation,
   Answers,
 } from "./types";
+export async function paperIssue(
+  accountId: string,
+  asOf: string,
+): Promise<string | null> {
+  const events = await query<{
+    instrument_id: string;
+    effective_date: string;
+    kind: string;
+  }>(
+    "SELECT * FROM corporate_actions WHERE effective_date<=? ORDER BY effective_date",
+    [asOf.slice(0, 10)],
+  );
+  for (const event of events) {
+    const boundary = event.effective_date + "T00:00:00.000Z";
+    const rows = await query<{ side: string; quantity: string }>(
+      "SELECT side,quantity FROM fills WHERE account_id=? AND instrument_id=? AND occurred_at<?",
+      [accountId, event.instrument_id, boundary],
+    );
+    const quantity = rows.reduce(
+      (sum, row) =>
+        sum.plus(new Decimal(row.quantity).mul(row.side === "buy" ? 1 : -1)),
+      new Decimal(0),
+    );
+    const pending = await query(
+      "SELECT id FROM orders WHERE account_id=? AND instrument_id=? AND status='pending' AND eligible_after<?",
+      [accountId, event.instrument_id, boundary],
+    );
+    if (quantity.gt(0) || pending.length)
+      return `${event.effective_date}の${event.kind === "split" ? "株式分割等の価格調整" : "配当"}を検出しました。この期間の模擬成績は検証対象外です。`;
+  }
+  return null;
+}
 export async function holdings(accountId: string): Promise<Holding[]> {
   const fills = await query<{
     instrument_id: string;
@@ -61,9 +93,12 @@ export async function paperSummaries(
   );
   const result: PaperSummary[] = [];
   for (const a of accounts) {
+    const unavailableReason = await paperIssue(a.id, asOf);
     const hs = await holdings(a.id);
     let value = new Decimal(a.cash);
+    let cost = new Decimal(0);
     for (const h of hs) {
+      cost = cost.plus(h.cost);
       const b = (await getBars(h.instrument_id, asOf)).at(-1);
       if (b) value = value.plus(new Decimal(h.quantity).mul(b.close));
     }
@@ -76,8 +111,15 @@ export async function paperSummaries(
     result.push({
       ...a,
       holdings: hs,
-      equity: value.toFixed(2),
-      pnl: value.minus(a.initial_cash).toFixed(2),
+      unavailableReason,
+      equity: unavailableReason ? null : value.toFixed(2),
+      pnl: unavailableReason ? null : value.minus(a.initial_cash).toFixed(2),
+      realizedPnl: unavailableReason
+        ? null
+        : new Decimal(a.cash).minus(a.initial_cash).plus(cost).toFixed(2),
+      unrealizedPnl: unavailableReason
+        ? null
+        : value.minus(a.cash).minus(cost).toFixed(2),
       maxDrawdown: maxDrawdown([
         Number(a.initial_cash),
         ...curve.map((x) => x.value),
@@ -135,6 +177,13 @@ export async function advancePaper(now = new Date()) {
     "SELECT * FROM accounts WHERE state='active'",
   );
   for (const a of accounts) {
+    if (await paperIssue(a.id, now.toISOString())) {
+      await db().execute({
+        sql: "UPDATE accounts SET state='unsupported' WHERE id=?",
+        args: [a.id],
+      });
+      continue;
+    }
     const items = await query<Instrument>(
       "SELECT * FROM instruments WHERE origin=? AND (watched=1 OR id IN (SELECT instrument_id FROM fills WHERE account_id=?))",
       [a.origin, a.id],
@@ -249,6 +298,7 @@ export async function advancePaper(now = new Date()) {
     const summary = (await paperSummaries(now.toISOString())).find(
       (x) => x.id === a.id,
     )!;
+    if (summary.equity === null) continue;
     const today = now.toISOString().slice(0, 10);
     const previous = await query<{ value: string }>(
       "SELECT value FROM equity WHERE account_id=? AND date<? ORDER BY date DESC LIMIT 1",
@@ -275,6 +325,13 @@ export async function advancePaper(now = new Date()) {
       if (!last || stats.sma20 === null || stale(last.date, now)) continue;
       const h = summary.holdings.find((x) => x.instrument_id === item.id);
       if (!h && !item.watched) continue;
+      if (!h) {
+        const issue = await query(
+          "SELECT id FROM corporate_actions WHERE instrument_id=? AND effective_date>=? AND effective_date<=? LIMIT 1",
+          [item.id, bars.at(-60)?.date ?? bars[0].date, last.date],
+        );
+        if (issue.length) continue;
+      }
       const above = Number(last.close) > stats.sma20;
       if ((h && above) || (!h && !above)) continue;
       if (!h && a.use_jev) {

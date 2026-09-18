@@ -151,7 +151,8 @@ export async function checkAlerts() {
     }
   }
 }
-export async function handleJob(job: Job) {
+type Continuation = { payload: Record<string, unknown>; delay?: number };
+export async function handleJob(job: Job): Promise<Continuation | undefined> {
   const p = JSON.parse(job.payload);
   if (job.kind === "evaluate") {
     const e = (
@@ -161,10 +162,24 @@ export async function handleJob(job: Job) {
     )[0];
     if (!e) throw new Error("評価が見つかりません。");
     if (e.status === "succeeded") return;
-    await db().execute({
-      sql: "UPDATE evaluations SET status='running',error=NULL WHERE id=?",
-      args: [e.id],
-    });
+    const attemptId = randomUUID();
+    await db().batch(
+      [
+        {
+          sql: "UPDATE attempts SET status='interrupted',error='応答保存前に処理が中断しました。課金状態は不明です。' WHERE evaluation_id=? AND status='running'",
+          args: [e.id],
+        },
+        {
+          sql: "UPDATE evaluations SET status='running',error=NULL WHERE id=?",
+          args: [e.id],
+        },
+        {
+          sql: "INSERT INTO attempts VALUES(?,?,?,?,?,?)",
+          args: [attemptId, e.id, "running", 0, null, new Date().toISOString()],
+        },
+      ],
+      "write",
+    );
     try {
       const r = await evaluate(JSON.parse(e.snapshot));
       await db().batch(
@@ -179,15 +194,8 @@ export async function handleJob(job: Job) {
             ],
           },
           {
-            sql: "INSERT INTO attempts VALUES(?,?,?,?,?,?)",
-            args: [
-              randomUUID(),
-              e.id,
-              "succeeded",
-              r.usage,
-              null,
-              new Date().toISOString(),
-            ],
+            sql: "UPDATE attempts SET status='succeeded',usage=?,error=NULL WHERE id=?",
+            args: [r.usage, attemptId],
           },
         ],
         "write",
@@ -202,15 +210,8 @@ export async function handleJob(job: Job) {
             args: [message, e.id],
           },
           {
-            sql: "INSERT INTO attempts VALUES(?,?,?,?,?,?)",
-            args: [
-              randomUUID(),
-              e.id,
-              "failed",
-              0,
-              message,
-              new Date().toISOString(),
-            ],
+            sql: "UPDATE attempts SET status='failed',error=? WHERE id=?",
+            args: [message, attemptId],
           },
         ],
         "write",
@@ -225,21 +226,74 @@ export async function handleJob(job: Job) {
       ])
     )[0];
     if (!item) throw new Error("商品が見つかりません。");
-    await refreshInstrument(item);
+    if ((p.page ?? 0) >= 100)
+      throw new Error("価格取得ページ上限に達しました。");
+    const key = await refreshInstrument(item, p.key);
+    if (key) return { payload: { ...p, key, page: (p.page ?? 0) + 1 } };
     await checkAlerts();
   } else if (job.kind === "master") {
-    await syncMaster();
+    if ((p.page ?? 0) >= 100)
+      throw new Error("マスター取得ページ上限に達しました。");
+    const key = await syncMaster(p.key);
+    if (key) return { payload: { ...p, key, page: (p.page ?? 0) + 1 } };
   } else if (job.kind === "paper") {
+    for (const id of p.dependencies ?? []) {
+      const [dependency] = await query<{ state: string }>(
+        "SELECT state FROM jobs WHERE id=?",
+        [id],
+      );
+      if (!dependency || dependency.state === "failed")
+        throw new Error(
+          "価格更新に失敗したため模擬運用を進められません。先に価格更新を再試行してください。",
+        );
+      if (dependency.state !== "succeeded") return { payload: p, delay: 30 };
+    }
     await advancePaper();
   } else if (job.kind === "alerts") {
     await checkAlerts();
   } else throw new Error("未対応のジョブです。");
 }
 export async function runJobs(budgetMs = 45000) {
-  const started = Date.now(),
-    owner = randomUUID();
+  const owner = randomUUID();
+  const expires = () => new Date(Date.now() + 120000).toISOString();
+  const lock = await db().execute({
+    sql: "INSERT INTO service_locks VALUES('worker',?,?) ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE service_locks.expires_at<? RETURNING owner",
+    args: [owner, expires(), new Date().toISOString()],
+  });
+  if (!lock.rows.length) return { completed: 0, busy: true };
+  let leaseLost = false;
+  const heartbeat = setInterval(() => {
+    void db()
+      .execute({
+        sql: "UPDATE service_locks SET expires_at=? WHERE name='worker' AND owner=?",
+        args: [expires(), owner],
+      })
+      .then((r) => {
+        if (!r.rowsAffected) leaseLost = true;
+      })
+      .catch(() => {
+        leaseLost = true;
+      });
+  }, 20000);
+  try {
+    return await drainJobs(budgetMs, owner, () => leaseLost);
+  } finally {
+    clearInterval(heartbeat);
+    await db().execute({
+      sql: "DELETE FROM service_locks WHERE name='worker' AND owner=?",
+      args: [owner],
+    });
+  }
+}
+async function drainJobs(
+  budgetMs: number,
+  owner: string,
+  leaseLost: () => boolean,
+) {
+  const started = Date.now();
   let completed = 0;
-  while (Date.now() - started < budgetMs) {
+  // Leave room for the longest HTTP request (30s), response validation and DB writes.
+  while (Date.now() - started < Math.max(0, budgetMs - 35000) && !leaseLost()) {
     const now = new Date().toISOString();
     const r = await db().execute({
       sql: `UPDATE jobs SET state='running',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=(SELECT id FROM jobs WHERE ((state IN ('pending','retry_wait') AND run_after<=?) OR (state='running' AND lease_until<?)) AND attempts<3 ORDER BY created_at LIMIT 1) RETURNING *`,
@@ -248,7 +302,19 @@ export async function runJobs(budgetMs = 45000) {
     if (!r.rows.length) break;
     const job = r.rows[0] as unknown as Job;
     try {
-      await handleJob(job);
+      const next = await handleJob(job);
+      if (next) {
+        await db().execute({
+          sql: "UPDATE jobs SET state='pending',payload=?,attempts=0,lease_until=NULL,lease_owner=NULL,run_after=? WHERE id=? AND lease_owner=?",
+          args: [
+            JSON.stringify(next.payload),
+            new Date(Date.now() + (next.delay ?? 0) * 1000).toISOString(),
+            job.id,
+            owner,
+          ],
+        });
+        continue;
+      }
       await db().execute({
         sql: "UPDATE jobs SET state='succeeded',lease_until=NULL,error=NULL WHERE id=? AND lease_owner=?",
         args: [job.id, owner],
@@ -286,14 +352,19 @@ export async function runJobs(budgetMs = 45000) {
 export async function scheduleDaily() {
   const day = new Date().toISOString().slice(0, 10);
   const items = await query<Instrument>(
-    "SELECT * FROM instruments WHERE watched=1",
+    "SELECT * FROM instruments WHERE watched=1 OR id IN (SELECT instrument_id FROM fills)",
   );
+  const dependencies: string[] = [];
   for (const item of items)
-    await enqueue(
-      "refresh",
-      { instrumentId: item.id },
-      "daily:" + day + ":" + item.id,
+    dependencies.push(
+      (
+        await enqueue(
+          "refresh",
+          { instrumentId: item.id },
+          "daily:" + day + ":" + item.id,
+        )
+      ).id,
     );
-  await enqueue("paper", {}, "daily-paper:" + day);
+  await enqueue("paper", { dependencies }, "daily-paper:" + day);
   await enqueue("alerts", {}, "daily-alerts:" + day);
 }

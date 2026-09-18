@@ -33,10 +33,12 @@ import {
 import type { Bootstrap, Answers, Evaluation, Bar } from "@/core/types";
 import { PriceChart, Sparkline } from "./chart";
 
-const yen = (v: string | number) =>
-  new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 2 }).format(
-    Number(v),
-  );
+const yen = (v: string | number | null) =>
+  v === null
+    ? "—"
+    : new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 2 }).format(
+        Number(v),
+      );
 const dateTime = (s: string | null) =>
   s
     ? new Date(s).toLocaleString("ja-JP", {
@@ -64,6 +66,7 @@ const labels: Record<string, string> = {
   active: "実行中",
   paused: "一時停止",
   stopped: "損失制限で停止",
+  unsupported: "検証対象外",
   demo: "デモ",
   jquants: "J-Quants",
   csv: "CSV",
@@ -811,7 +814,12 @@ export function Dashboard({
                         : "positive"
                     }
                   >
-                    ¥{yen(data.accounts.reduce((s, a) => s + Number(a.pnl), 0))}
+                    {data.accounts.some((a) => a.pnl === null)
+                      ? "検証対象外の口座あり"
+                      : "¥" +
+                        yen(
+                          data.accounts.reduce((s, a) => s + Number(a.pnl), 0),
+                        )}
                   </strong>
                   <small>
                     {data.accounts.length
@@ -1119,6 +1127,9 @@ export function Dashboard({
                           {labels[a.state]}
                         </Badge>
                       </SectionTitle>
+                      {a.unavailableReason && (
+                        <p className="notice">{a.unavailableReason}</p>
+                      )}
                       <div className="paper-numbers">
                         <div>
                           <small>評価資産</small>
@@ -1135,7 +1146,7 @@ export function Dashboard({
                           </strong>
                         </div>
                       </div>
-                      {a.curve.length > 1 ? (
+                      {!a.unavailableReason && a.curve.length > 1 ? (
                         <Sparkline large values={a.curve.map((x) => x.value)} />
                       ) : (
                         <div className="muted paper-wait">
@@ -1145,8 +1156,16 @@ export function Dashboard({
                       <dl>
                         <dt>仮想現金</dt>
                         <dd>¥{yen(a.cash)}</dd>
+                        <dt>実現損益（売却手数料込み）</dt>
+                        <dd>¥{yen(a.realizedPnl)}</dd>
+                        <dt>含み損益（購入手数料込み）</dt>
+                        <dd>¥{yen(a.unrealizedPnl)}</dd>
                         <dt>最大ドローダウン</dt>
-                        <dd>{a.maxDrawdown.toFixed(2)}%</dd>
+                        <dd>
+                          {a.unavailableReason
+                            ? "—"
+                            : a.maxDrawdown.toFixed(2) + "%"}
+                        </dd>
                         <dt>保有商品数</dt>
                         <dd>{a.holdings.length}</dd>
                       </dl>
@@ -1165,7 +1184,7 @@ export function Dashboard({
                       <div className="row-between">
                         <button
                           className="secondary"
-                          disabled={busy}
+                          disabled={busy || !!a.unavailableReason}
                           onClick={() =>
                             void act({
                               action: "paperState",
@@ -1364,6 +1383,87 @@ export function Dashboard({
                     待機中の処理を実行
                   </button>
                 </div>
+              </div>
+              <div className="card">
+                <SectionTitle
+                  title="分割・配当の記録"
+                  sub="未対応の企業行動が保有期間にある場合、模擬運用を停止して成績を検証対象外にします。J-Quantsの価格調整係数は自動検出します。配当等は確認した資料から登録してください。"
+                />
+                <form
+                  className="stack"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const form = new FormData(e.currentTarget);
+                    void act({
+                      action: "corporateAction",
+                      ...Object.fromEntries(form),
+                    });
+                  }}
+                >
+                  <div className="form-grid">
+                    <label>
+                      対象商品
+                      <select name="id" required>
+                        {data.instruments.map((i) => (
+                          <option value={i.id} key={i.id}>
+                            {i.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      効力発生日
+                      <input type="date" name="date" required />
+                    </label>
+                    <label>
+                      種類
+                      <select name="kind">
+                        <option value="split">分割・併合</option>
+                        <option value="dividend">配当</option>
+                      </select>
+                    </label>
+                    <label>
+                      出典・内容
+                      <input
+                        name="details"
+                        maxLength={1000}
+                        required
+                        placeholder="確認した開示資料など"
+                      />
+                    </label>
+                  </div>
+                  <button
+                    className="secondary"
+                    disabled={busy || !data.instruments.length}
+                  >
+                    企業行動を記録
+                  </button>
+                </form>
+                {data.corporateActions.map((event) => (
+                  <div className="row-between tiny" key={event.id}>
+                    <span>
+                      {event.effective_date} ·{" "}
+                      {
+                        data.instruments.find(
+                          (i) => i.id === event.instrument_id,
+                        )?.name
+                      }{" "}
+                      · {event.kind === "split" ? "分割・併合" : "配当"}
+                    </span>
+                    <button
+                      className="text-button"
+                      disabled={busy}
+                      onClick={() =>
+                        void act({
+                          action: "deleteCorporateAction",
+                          id: event.id,
+                        })
+                      }
+                    >
+                      誤記録を削除
+                    </button>
+                  </div>
+                ))}
               </div>
               <div className="card">
                 <SectionTitle title="最近の処理" />

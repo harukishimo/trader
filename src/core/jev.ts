@@ -32,6 +32,13 @@ export const answersSchema = z.object({
     type: z.literal("score"),
     score: z.number().finite().min(0).max(2),
     confidence: probability,
+    probabilities: distribution
+      .refine(
+        (x) =>
+          Object.keys(x).length === 3 && ["0", "1", "2"].every((k) => k in x),
+      )
+      .optional(),
+    legend: z.record(z.string(), z.string()).optional(),
   }),
   duplicate: z.object({ type: z.literal("noul"), noul: probability }),
 });

@@ -43,6 +43,8 @@ export const schema = [
   `CREATE TABLE IF NOT EXISTS status(name TEXT PRIMARY KEY,value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,event TEXT NOT NULL,details TEXT NOT NULL,created_at TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,expires_at TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS service_locks(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires_at TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS corporate_actions(id TEXT PRIMARY KEY,instrument_id TEXT NOT NULL REFERENCES instruments(id),effective_date TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL)`,
 ];
 export async function initialize() {
   if (!ready)

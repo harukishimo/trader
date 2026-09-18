@@ -10,7 +10,7 @@ import {
   runJobs,
   scheduleDaily,
 } from "@/core/jobs";
-import { importCsv } from "@/core/market";
+import { importCsv, recordCorporateAction } from "@/core/market";
 import { createAccounts } from "@/core/paper";
 const id = z.string().min(1).max(120);
 const decimal = (min: number, max: number) =>
@@ -23,6 +23,21 @@ const schema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("watch"), id, enabled: z.boolean() }),
   z.object({ action: z.literal("refresh"), id: id.optional() }),
   z.object({ action: z.literal("master") }),
+  z.object({
+    action: z.literal("corporateAction"),
+    id,
+    date: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .refine(
+        (v) =>
+          Number.isFinite(Date.parse(v)) &&
+          new Date(v).toISOString().slice(0, 10) === v,
+      ),
+    kind: z.enum(["split", "dividend"]),
+    details: z.string().min(1).max(1000),
+  }),
+  z.object({ action: z.literal("deleteCorporateAction"), id }),
   z.object({
     action: z.literal("evaluate"),
     id,
@@ -92,6 +107,16 @@ export async function POST(request: Request) {
     const p = schema.parse(JSON.parse(raw));
     let result: unknown = { ok: true };
     switch (p.action) {
+      case "corporateAction":
+        await recordCorporateAction(p.id, p.date, p.kind, p.details);
+        await enqueue("paper", {}, "paper:" + randomUUID());
+        break;
+      case "deleteCorporateAction":
+        await db().execute({
+          sql: "DELETE FROM corporate_actions WHERE id=?",
+          args: [p.id],
+        });
+        break;
       case "watch":
         await db().execute({
           sql: "UPDATE instruments SET watched=? WHERE id=?",
