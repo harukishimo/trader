@@ -4,6 +4,8 @@ Next.js / TypeScriptで作る個人用の投資商品モニターです。ウォ
 
 初期状態は架空の商品と合成価格によるデモです。Jevのモック評価はキーワードによる固定ルールであり、実際のJevの出力ではありません。実注文やSBI証券への接続は実装していません。
 
+公開先：[trader](https://trader-alpha-one.vercel.app)。ログイン用パスワードが必要です。配置・クラウド検証の記録は [DEPLOYMENT.md](DEPLOYMENT.md) にあります。
+
 ## 起動
 
 Node.js 22 LTS（22.16以降）とnpmを使用します。`.nvmrc` と `engines` でメジャーバージョンを固定しています。
