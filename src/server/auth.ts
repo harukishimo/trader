@@ -1,13 +1,16 @@
 import { cookies } from "next/headers";
 import { createHmac, timingSafeEqual, createHash } from "node:crypto";
+import { databaseSettings } from "@/core/config";
 export function configured() {
+  const database = databaseSettings();
   return (
     !process.env.VERCEL ||
     !!(
       process.env.APP_PASSWORD &&
       process.env.SESSION_SECRET &&
-      process.env.DATABASE_URL &&
-      !process.env.DATABASE_URL.startsWith("file:")
+      database.url &&
+      /^(libsql|https):/.test(database.url) &&
+      database.authToken
     )
   );
 }

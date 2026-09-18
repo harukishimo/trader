@@ -1,4 +1,4 @@
-import { db, initialize, query } from "./db";
+import { db, initialize, query, databaseUrl } from "./db";
 import { seed, getBars } from "./market";
 import { paperSummaries } from "./paper";
 import type { Alert, Bootstrap, Evaluation, Instrument, Job } from "./types";
@@ -55,11 +55,7 @@ export async function bootstrap(): Promise<Bootstrap> {
     alertEvents,
     accounts,
     status: {
-      database:
-        process.env.DATABASE_URL?.startsWith("libsql:") ||
-        process.env.DATABASE_URL?.startsWith("https:")
-          ? "Turso"
-          : "SQLite",
+      database: /^(libsql|https):/.test(databaseUrl()) ? "Turso" : "SQLite",
       mode: process.env.APP_MODE || "demo",
       jev: process.env.JEV_PROVIDER || "mock",
       market: process.env.MARKET_DATA_PROVIDER || "demo",

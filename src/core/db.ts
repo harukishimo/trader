@@ -1,11 +1,12 @@
 import { createClient, type Client, type InValue } from "@libsql/client";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { databaseSettings } from "./config";
 
 let client: Client | undefined;
 let ready: Promise<void> | undefined;
 export function databaseUrl() {
-  const value = process.env.DATABASE_URL;
+  const value = databaseSettings().url;
   if (process.env.VERCEL && (!value || value.startsWith("file:")))
     throw new Error("Vercelでは永続DBのDATABASE_URLを設定してください。");
   return value || "file:./data/trader.db";
@@ -13,7 +14,7 @@ export function databaseUrl() {
 export function db() {
   return (client ??= createClient({
     url: databaseUrl(),
-    authToken: process.env.DATABASE_AUTH_TOKEN,
+    authToken: databaseSettings().authToken,
   }));
 }
 export async function query<T>(

@@ -63,7 +63,7 @@ npm run dev
 | `JQUANTS_API_KEY`        | J-Quants V2利用時に必要                    |
 | `ALLOW_AI_DATA_TRANSFER` | Jevへの外部送信を許可するときだけ `true`   |
 
-Tursoの連携が `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` を発行する場合は、それぞれ上記の `DATABASE_URL` / `DATABASE_AUTH_TOKEN` に設定してください。キーを `NEXT_PUBLIC_` 変数に入れないでください。
+Turso連携が発行する `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` も自動で読み込みます。`DATABASE_URL` / `DATABASE_AUTH_TOKEN` が指定されていればそちらを優先します。キーを `NEXT_PUBLIC_` 変数に入れないでください。
 
 環境変数の値を表示せずに設定を検査できます。
 
